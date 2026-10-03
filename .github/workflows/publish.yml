@@ -1,0 +1,76 @@
+name: Publish Go SDK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: go-sdk-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: codebuild-reelay-go-sdk-github-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go build ./...
+      - run: go vet ./...
+      - name: Check formatting
+        shell: bash
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go test -race ./...
+      - name: Check public repository and release version
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          private=$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY" |
+            python3 -c 'import json,sys; print(str(json.load(sys.stdin)["private"]).lower())')
+          if [ "$private" != false ]; then
+            echo "A public Go module needs a public GitHub repository." >&2
+            exit 1
+          fi
+          version=$(tr -d '[:space:]' < VERSION)
+          if ! [[ "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "VERSION must contain a semver tag such as v0.1.0" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$version" >/dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "$version already exists. Bump VERSION for the next release."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish module tag
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git tag "$VERSION"
+          git push origin "refs/tags/$VERSION"
+      - name: Index public module
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          GOPROXY=https://proxy.golang.org go list -m "github.com/OpenResearchGuys/reelay-go-sdk@$VERSION"
